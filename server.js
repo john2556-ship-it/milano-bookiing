@@ -174,6 +174,36 @@ function formatTime12h(timeStr) {
   return `${hour12}:${String(m).padStart(2,'0')} ${ampm}`;
 }
 
+async function createAtsoftAppointment(data) {
+  const cookie = await getAtsoftCookie();
+  const payload = JSON.stringify({
+    AppointmentDate:  data.appointmentDate,
+    CustomerName:     data.customerName,
+    CustomerPhone:    data.customerPhone,
+    IsBlockOff:       false,
+    SelectedServices: [],
+    TechnicianId:     parseInt(data.employeeId) || 1,
+    TimeStart:        data.timeStart,
+    TimeEnd:          data.timeEnd,
+    StoreId:          STORE_ID,
+    Notes:            data.notes || ''
+  });
+  const res = await fetchUrl(`${ATSOFT_BASE}/api/events/create-appointment`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/javascript, */*; q=0.01',
+      'Cookie': cookie,
+      'Referer': `${ATSOFT_BASE}/Dashboard/Calendar`,
+      'X-Requested-With': 'XMLHttpRequest',
+      'Content-Length': Buffer.byteLength(payload)
+    },
+    body: payload
+  });
+  console.log(`📡 ATSoft: ${res.status} - ${res.body}`);
+  return { status: res.status, body: res.body };
+}
+
 // ── Improved fetchUrl with redirect & cookie support ──────────────
 async function fetchUrlFull(url, options = {}, maxRedirects = 3) {
   return new Promise((resolve, reject) => {
@@ -284,6 +314,9 @@ async function scrapeAvailabilityFromATSoft(date, employeeId) {
       body: params2.toString()
     });
     console.log(`  Step2 status: ${step2.status}`);
+
+    const state2 = extractFormState(step2.body);
+
     // Build Step 3 Body dynamically
     const [y, m, d] = date.split('-');
     const atsoftDate = `${m}/${d}/${y}`;
@@ -367,91 +400,6 @@ async function scrapeAvailabilityFromATSoft(date, employeeId) {
   }
 }
 
-    const csrf2Match = step2.body.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/);
-    if (!csrf2Match) { console.log('  ❌ No CSRF token in step2'); return null; }
-    const csrf2 = csrf2Match[1];
-    console.log(`  ✅ CSRF2 found`);
-
-    // Step 3: POST date → /Book/Booking3
-    const [y, m, d] = date.split('-');
-    const atsoftDate = `${m}/${d}/${y}`;
-    const body3 = `__RequestVerificationToken=${encodeURIComponent(csrf2)}&SelectedDate=${encodeURIComponent(atsoftDate)}`;
-    const step3 = await fetchUrlFull(`${ATSOFT_BASE}/Book/Booking3`, {
-      method: 'POST',
-      headers: {
-        'User-Agent': UA,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Cookie': step2.cookies,
-        'Referer': `${ATSOFT_BASE}/Book/Booking2`
-      },
-      body: body3
-    });
-    console.log(`  Step3 status: ${step3.status}`);
-
-    const html = step3.body;
-
-    // Parse time slots (Primary Regex)
-    const slots = [];
-    const slotRegex = /<input([^>]*?)timeidx="(\d+)"([^>]*?)>[\s\S]*?<span[^>]*timeidx="\d+"[^>]*>\s*([\d:]+\s*[AP]M)\s*<\/span>/gi;
-    let match;
-    
-    while ((match = slotRegex.exec(html)) !== null) {
-      const before = match[1] + match[3];
-      const timeidx = parseInt(match[2]);
-      const timeText = match[4].trim();
-      const isDisabled = before.includes('disabled');
-
-      let reason = null;
-      if (isDisabled) {
-        const spanMatch = html.substring(match.index, match.index + 500).match(/title="([^"]+)"/);
-        reason = spanMatch ? spanMatch[1] : 'Unavailable';
-      }
-
-      slots.push({
-        timeidx,
-        time: timeText,
-        available: !isDisabled,
-        reason: isDisabled ? reason : null
-      });
-    }
-
-    // Fallback parsing if primary regex fails
-    if (slots.length === 0) {
-      console.log('  ⚠️ Using fallback regex parser...');
-      const simpleRegex = /timeidx="(\d+)"[^>]*>\s*([\d:]+\s*[AP]M)\s*</gi;
-      const disabledIdxRegex = /<input\s+disabled[^>]*timeidx="(\d+)"/gi;
-      const disabledSet = new Set();
-      
-      let dm;
-      while ((dm = disabledIdxRegex.exec(html)) !== null) {
-        disabledSet.add(parseInt(dm[1]));
-      }
-      
-      let sm;
-      const seen = new Set();
-      while ((sm = simpleRegex.exec(html)) !== null) {
-        const idx = parseInt(sm[1]);
-        if (seen.has(idx)) continue;
-        seen.add(idx);
-        
-        slots.push({
-          timeidx: idx,
-          time: sm[2].trim(),
-          available: !disabledSet.has(idx),
-          reason: disabledSet.has(idx) ? 'Unavailable' : null
-        });
-      }
-    }
-
-    console.log(`  ✅ Parsed ${slots.length} slots, ${slots.filter(s=>!s.available).length} taken`);
-    return slots.length > 0 ? slots : null;
-
-  } catch (err) {
-    console.error('❌ scrapeAvailability error:', err.message);
-    return null;
-  }
-}
-
 // ==========================================
 // GET /api/debug-availability — debug only
 // ==========================================
@@ -485,6 +433,7 @@ app.get('/', (req, res) => {
       'GET  /api/employees',
       'GET  /api/technicians (alias)',
       'GET  /api/services',
+      'GET  /api/closed-dates',
       'GET  /api/availability?date=YYYY-MM-DD&employeeId=0',
       'POST /api/booking'
     ]
@@ -700,7 +649,7 @@ app.post('/api/booking', async (req, res) => {
   }
 });
 
-const PORT = 3456;
+const PORT = process.env.PORT || 3456;
 app.listen(PORT, async () => {
   console.log(`✅ Milano Booking API v3.0 running on port ${PORT}`);
   console.log(`🌐 Mode: Cloud-first (ATSoft HTML scraping)`);
