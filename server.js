@@ -174,37 +174,7 @@ function formatTime12h(timeStr) {
   return `${hour12}:${String(m).padStart(2,'0')} ${ampm}`;
 }
 
-async function createAtsoftAppointment(data) {
-  const cookie = await getAtsoftCookie();
-  const payload = JSON.stringify({
-    AppointmentDate:  data.appointmentDate,
-    CustomerName:     data.customerName,
-    CustomerPhone:    data.customerPhone,
-    IsBlockOff:       false,
-    SelectedServices: [],
-    TechnicianId:     parseInt(data.employeeId) || 1,
-    TimeStart:        data.timeStart,
-    TimeEnd:          data.timeEnd,
-    StoreId:          STORE_ID,
-    Notes:            data.notes || ''
-  });
-  const res = await fetchUrl(`${ATSOFT_BASE}/api/events/create-appointment`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json, text/javascript, */*; q=0.01',
-      'Cookie': cookie,
-      'Referer': `${ATSOFT_BASE}/Dashboard/Calendar`,
-      'X-Requested-With': 'XMLHttpRequest',
-      'Content-Length': Buffer.byteLength(payload)
-    },
-    body: payload
-  });
-  console.log(`📡 ATSoft: ${res.status} - ${res.body}`);
-  return { status: res.status, body: res.body };
-}
-
-// ── Improved fetchUrl with redirect support ──────────────
+// ── Improved fetchUrl with redirect & cookie support ──────────────
 async function fetchUrlFull(url, options = {}, maxRedirects = 3) {
   return new Promise((resolve, reject) => {
     const doRequest = (currentUrl, redirectsLeft, cookieJar) => {
@@ -219,15 +189,24 @@ async function fetchUrlFull(url, options = {}, maxRedirects = 3) {
       if (cookieJar) reqOptions.headers['Cookie'] = cookieJar;
       const req = lib.request(reqOptions, (res) => {
         let data = '';
-        // Collect new cookies
-        const newCookies = (res.headers['set-cookie'] || []).map(c => c.split(';')[0]);
-        const allCookies = [
-          ...(cookieJar ? cookieJar.split('; ') : []),
-          ...newCookies
-        ].filter((c, i, arr) => {
-          const key = c.split('=')[0];
-          return arr.findIndex(x => x.split('=')[0] === key) === i;
-        }).join('; ');
+        
+        // 🛠️ FIX: Properly merge cookies (New cookies overwrite old ones)
+        const cookieMap = new Map();
+        if (cookieJar) {
+          cookieJar.split('; ').forEach(c => {
+            const parts = c.split('=');
+            if (parts.length >= 2) cookieMap.set(parts[0], parts.slice(1).join('='));
+          });
+        }
+        const newCookies = res.headers['set-cookie'] || [];
+        newCookies.forEach(c => {
+          const primary = c.split(';')[0];
+          const parts = primary.split('=');
+          if (parts.length >= 2) cookieMap.set(parts[0], parts.slice(1).join('='));
+        });
+        const allCookies = Array.from(cookieMap.entries())
+          .map(([k, v]) => `${k}=${v}`)
+          .join('; ');
 
         // Follow redirects
         if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 303) && redirectsLeft > 0) {
@@ -250,6 +229,24 @@ async function fetchUrlFull(url, options = {}, maxRedirects = 3) {
   });
 }
 
+// 🛠️ FIX: Helper to extract hidden ASP.NET tracking state fields
+function extractFormState(html) {
+  const state = [];
+  const regex = /<input[^>]*name=["']([^"']+)["'][^>]*value=["']([^"']*)["']/gi;
+  let match;
+  while ((match = regex.exec(html)) !== null) {
+    const fullTag = match[0].toLowerCase();
+    const name = match[1];
+    const value = match[2];
+    if (fullTag.includes('type="hidden"') || name === '__RequestVerificationToken') {
+      if (!state.find(s => s.name === name)) {
+        state.push({ name, value });
+      }
+    }
+  }
+  return state;
+}
+
 // ── Scrape Availability từ ATSoft HTML ──────────────────
 async function scrapeAvailabilityFromATSoft(date, employeeId) {
   console.log(`🔍 Scraping availability: date=${date} empId=${employeeId}`);
@@ -262,18 +259,20 @@ async function scrapeAvailabilityFromATSoft(date, employeeId) {
     });
     console.log(`  Step1 status: ${step1.status}`);
 
-    const csrf1Match = step1.body.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/);
-    if (!csrf1Match) { console.log('  ❌ No CSRF token in step1'); return null; }
-    const csrf1 = csrf1Match[1];
-    console.log(`  ✅ CSRF1 found`);
+    const state1 = extractFormState(step1.body);
+    if (state1.length === 0) { console.log('  ❌ No form state found in step1'); return null; }
 
-    // Extract employee service form data (pick first service available, default to 1)
     const serviceMatch = step1.body.match(/name="SelectedServices"[^>]+value="(\d+)"/);
     const serviceId = serviceMatch ? serviceMatch[1] : '1';
+    const empId = parseInt(employeeId) || 0;
+
+    // Build Step 2 Body dynamically 
+    const params2 = new URLSearchParams();
+    state1.forEach(s => params2.append(s.name, s.value));
+    params2.append('SelectedEmployeeLocalID', empId);
+    params2.append('SelectedServices', serviceId);
 
     // Step 2: POST employee + service selection → /Book/Booking2
-    const empId = parseInt(employeeId) || 0;
-    const body2 = `__RequestVerificationToken=${encodeURIComponent(csrf1)}&SelectedEmployeeLocalID=${empId}&SelectedServices=${serviceId}`;
     const step2 = await fetchUrlFull(`${ATSOFT_BASE}/Book/Booking2`, {
       method: 'POST',
       headers: {
@@ -282,9 +281,91 @@ async function scrapeAvailabilityFromATSoft(date, employeeId) {
         'Cookie': step1.cookies,
         'Referer': `${ATSOFT_BASE}/Book/${STORE_ID}`
       },
-      body: body2
+      body: params2.toString()
     });
     console.log(`  Step2 status: ${step2.status}`);
+    // Build Step 3 Body dynamically
+    const [y, m, d] = date.split('-');
+    const atsoftDate = `${m}/${d}/${y}`;
+    const params3 = new URLSearchParams();
+    state2.forEach(s => params3.append(s.name, s.value));
+    params3.append('SelectedDate', atsoftDate);
+
+    // Step 3: POST date → /Book/Booking3
+    const step3 = await fetchUrlFull(`${ATSOFT_BASE}/Book/Booking3`, {
+      method: 'POST',
+      headers: {
+        'User-Agent': UA,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Cookie': step2.cookies,
+        'Referer': `${ATSOFT_BASE}/Book/Booking2`
+      },
+      body: params3.toString()
+    });
+    console.log(`  Step3 status: ${step3.status}`);
+
+    const html = step3.body;
+
+    // Parse time slots (Primary Regex)
+    const slots = [];
+    const slotRegex = /<input([^>]*?)timeidx="(\d+)"([^>]*?)>[\s\S]*?<span[^>]*timeidx="\d+"[^>]*>\s*([\d:]+\s*[AP]M)\s*<\/span>/gi;
+    let match;
+    
+    while ((match = slotRegex.exec(html)) !== null) {
+      const before = match[1] + match[3];
+      const timeidx = parseInt(match[2]);
+      const timeText = match[4].trim();
+      const isDisabled = before.includes('disabled');
+
+      let reason = null;
+      if (isDisabled) {
+        const spanMatch = html.substring(match.index, match.index + 500).match(/title="([^"]+)"/);
+        reason = spanMatch ? spanMatch[1] : 'Unavailable';
+      }
+
+      slots.push({
+        timeidx,
+        time: timeText,
+        available: !isDisabled,
+        reason: isDisabled ? reason : null
+      });
+    }
+
+    if (slots.length === 0) {
+      console.log('  ⚠️ Using fallback regex parser...');
+      const simpleRegex = /timeidx="(\d+)"[^>]*>\s*([\d:]+\s*[AP]M)\s*</gi;
+      const disabledIdxRegex = /<input[^>]*disabled[^>]*timeidx="(\d+)"/gi;
+      const disabledSet = new Set();
+      
+      let dm;
+      while ((dm = disabledIdxRegex.exec(html)) !== null) {
+        disabledSet.add(parseInt(dm[1]));
+      }
+      
+      let sm;
+      const seen = new Set();
+      while ((sm = simpleRegex.exec(html)) !== null) {
+        const idx = parseInt(sm[1]);
+        if (seen.has(idx)) continue;
+        seen.add(idx);
+        
+        slots.push({
+          timeidx: idx,
+          time: sm[2].trim(),
+          available: !disabledSet.has(idx),
+          reason: disabledSet.has(idx) ? 'Unavailable' : null
+        });
+      }
+    }
+
+    console.log(`  ✅ Parsed ${slots.length} slots, ${slots.filter(s=>!s.available).length} taken`);
+    return slots.length > 0 ? slots : null;
+
+  } catch (err) {
+    console.error('❌ scrapeAvailability error:', err.message);
+    return null;
+  }
+}
 
     const csrf2Match = step2.body.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/);
     if (!csrf2Match) { console.log('  ❌ No CSRF token in step2'); return null; }
