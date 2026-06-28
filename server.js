@@ -204,9 +204,299 @@ async function createAtsoftAppointment(data) {
   return { status: res.status, body: res.body };
 }
 
+// ── Improved fetchUrl with redirect support ──────────────
+async function fetchUrlFull(url, options = {}, maxRedirects = 3) {
+  return new Promise((resolve, reject) => {
+    const doRequest = (currentUrl, redirectsLeft, cookieJar) => {
+      const urlObj = new URL(currentUrl);
+      const lib = urlObj.protocol === 'https:' ? https : http;
+      const reqOptions = {
+        hostname: urlObj.hostname,
+        path: urlObj.pathname + urlObj.search,
+        method: options.method || 'GET',
+        headers: { ...options.headers }
+      };
+      if (cookieJar) reqOptions.headers['Cookie'] = cookieJar;
+      const req = lib.request(reqOptions, (res) => {
+        let data = '';
+        // Collect new cookies
+        const newCookies = (res.headers['set-cookie'] || []).map(c => c.split(';')[0]);
+        const allCookies = [
+          ...(cookieJar ? cookieJar.split('; ') : []),
+          ...newCookies
+        ].filter((c, i, arr) => {
+          const key = c.split('=')[0];
+          return arr.findIndex(x => x.split('=')[0] === key) === i;
+        }).join('; ');
+
+        // Follow redirects
+        if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 303) && redirectsLeft > 0) {
+          const location = res.headers['location'];
+          if (location) {
+            const nextUrl = location.startsWith('http') ? location : `${urlObj.protocol}//${urlObj.hostname}${location}`;
+            res.resume();
+            doRequest(nextUrl, redirectsLeft - 1, allCookies);
+            return;
+          }
+        }
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data, cookies: allCookies }));
+      });
+      req.on('error', reject);
+      if (options.body) req.write(options.body);
+      req.end();
+    };
+    doRequest(url, maxRedirects, options.headers ? options.headers['Cookie'] : '');
+  });
+}
+
+// ── Scrape Availability từ ATSoft HTML ──────────────────
+async function scrapeAvailabilityFromATSoft(date, employeeId) {
+  console.log(`🔍 Scraping availability: date=${date} empId=${employeeId}`);
+  try {
+    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+    // Step 1: GET /Book/STORE_ID
+    const step1 = await fetchUrlFull(`${ATSOFT_BASE}/Book/${STORE_ID}`, {
+      headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml' }
+    });
+    console.log(`  Step1 status: ${step1.status}`);
+
+    const csrf1 = (step1.body.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/) || [])[1];
+    if (!csrf1) { console.log('  ❌ No CSRF token in step1'); return null; }
+    console.log(`  ✅ CSRF1 found (${csrf1.length} chars)`);
+
+    // Step 2: POST employee selection → /Book/Booking2
+    const empId = parseInt(employeeId) || 0;
+    const body2 = `__RequestVerificationToken=${encodeURIComponent(csrf1)}&SelectedEmployeeLocalID=${empId}`;
+    const step2 = await fetchUrlFull(`${ATSOFT_BASE}/Book/Booking2`, {
+      method: 'POST',
+      headers: {
+        'User-Agent': UA,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Cookie': step1.cookies,
+        'Referer': `${ATSOFT_BASE}/Book/${STORE_ID}`
+      },
+      body: body2
+    });
+    console.log(`  Step2 status: ${step2.status}, body length: ${step2.body.length}`);
+
+    const csrf2 = (step2.body.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/) || [])[1];
+    if (!csrf2) { console.log('  ❌ No CSRF token in step2'); return null; }
+    console.log(`  ✅ CSRF2 found`);
+
+    // Step 3: POST date → /Book/Booking3
+    const [y, m, d] = date.split('-');
+    const atsoftDate = `${m}/${d}/${y}`;
+    const body3 = `__RequestVerificationToken=${encodeURIComponent(csrf2)}&SelectedDate=${encodeURIComponent(atsoftDate)}`;
+    const step3 = await fetchUrlFull(`${ATSOFT_BASE}/Book/Booking3`, {
+      method: 'POST',
+      headers: {
+        'User-Agent': UA,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Cookie': step2.cookies,
+        'Referer': `${ATSOFT_BASE}/Book/Booking2`
+      },
+      body: body3
+    });
+    console.log(`  Step3 status: ${step3.status}, body length: ${step3.body.length}`);
+
+    const html = step3.body;
+    if (!html.includes('timeidx')) {
+      console.log('  ❌ No timeidx found in step3 response');
+      console.log('  Preview:', html.substring(0, 500));
+      return null;
+    }
+
+    // Parse time slots
+    const slots = [];
+    const disabledIdxs = new Set();
+    const disabledReasons = {};
+
+    // Find disabled inputs
+    const disRe = /<input\s+disabled[^>]*timeidx="(\d+)"[^>]*>[\s\S]{0,300}?title="([^"]+)"/gi;
+    let dm;
+    while ((dm = disRe.exec(html)) !== null) {
+      const idx = parseInt(dm[1]);
+      disabledIdxs.add(idx);
+      disabledReasons[idx] = dm[2];
+    }
+
+    // Also catch disabled without title
+    const disRe2 = /<input\s+disabled[^>]*timeidx="(\d+)"/gi;
+    while ((dm = disRe2.exec(html)) !== null) {
+      disabledIdxs.add(parseInt(dm[1]));
+    }
+
+    // Find all time slot texts
+    const timeRe = /timeidx="(\d+)"[^>]*>\s*([\d:]+\s*[AP]M)\s*</gi;
+    const seen = new Set();
+    while ((dm = timeRe.exec(html)) !== null) {
+      const idx = parseInt(dm[1]);
+      if (seen.has(idx)) continue;
+      seen.add(idx);
+      slots.push({
+        timeidx: idx,
+        time: dm[2].trim(),
+        available: !disabledIdxs.has(idx),
+        reason: disabledReasons[idx] || null
+      });
+    }
+
+    console.log(`  ✅ Parsed ${slots.length} slots, ${slots.filter(s=>!s.available).length} taken`);
+    return slots.length > 0 ? slots : null;
+
+  } catch (err) {
+    console.error('❌ scrapeAvailability error:', err.message);
+    return null;
+  }
+}
+
 // ==========================================
-// GET / — API info
+// GET /api/debug-availability — debug only
 // ==========================================
+app.get('/api/debug-availability', async (req, res) => {
+  const { date, employeeId } = req.query;
+  const d = date || new Date().toISOString().split('T')[0];
+  const e = employeeId || '0';
+  try {
+    const slots = await scrapeAvailabilityFromATSoft(d, e);
+    res.json({
+      success: true,
+      date: d,
+      employeeId: e,
+      slots_found: slots ? slots.length : 0,
+      taken: slots ? slots.filter(s=>!s.available).length : 0,
+      sample: slots ? slots.slice(0,5) : null,
+      raw_result: slots
+    });
+  } catch(err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+  console.log(`🔍 Scraping availability for date=${date} employeeId=${employeeId}`);
+
+  try {
+    const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15';
+
+    // Step 1: GET /Book/498 → lấy session cookie + CSRF token
+    const step1 = await fetchUrl(`${ATSOFT_BASE}/Book/${STORE_ID}`, {
+      headers: { 'User-Agent': UA, 'Accept': 'text/html' }
+    });
+
+    // Extract session cookie
+    const cookies1 = (step1.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
+
+    // Extract CSRF token
+    const csrfMatch = step1.body.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/);
+    if (!csrfMatch) throw new Error('Cannot find CSRF token in step 1');
+    const csrf1 = csrfMatch[1];
+
+    // Extract employee service form data (pick first service available)
+    const serviceMatch = step1.body.match(/name="SelectedServices"[^>]+value="(\d+)"/);
+    const serviceId = serviceMatch ? serviceMatch[1] : '1';
+
+    // Step 2: POST technician + service selection → /Book/Booking2
+    const body2 = `__RequestVerificationToken=${encodeURIComponent(csrf1)}&SelectedEmployeeLocalID=${employeeId || 0}&SelectedServices=${serviceId}`;
+    const step2 = await fetchUrl(`${ATSOFT_BASE}/Book/Booking2`, {
+      method: 'POST',
+      headers: {
+        'User-Agent': UA,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Cookie': cookies1,
+        'Referer': `${ATSOFT_BASE}/Book/${STORE_ID}`
+      },
+      body: body2
+    });
+
+    const cookies2 = [
+      cookies1,
+      ...(step2.headers['set-cookie'] || []).map(c => c.split(';')[0])
+    ].join('; ');
+
+    // Extract CSRF token from step 2
+    const csrf2Match = step2.body.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/);
+    if (!csrf2Match) throw new Error('Cannot find CSRF token in step 2');
+    const csrf2 = csrf2Match[1];
+
+    // Format date for ATSoft (MM/DD/YYYY)
+    const [y, m, d] = date.split('-');
+    const atsoftDate = `${m}/${d}/${y}`;
+
+    // Step 3: POST date → /Book/Booking3
+    const body3 = `__RequestVerificationToken=${encodeURIComponent(csrf2)}&SelectedDate=${encodeURIComponent(atsoftDate)}`;
+    const step3 = await fetchUrl(`${ATSOFT_BASE}/Book/Booking3`, {
+      method: 'POST',
+      headers: {
+        'User-Agent': UA,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Cookie': cookies2,
+        'Referer': `${ATSOFT_BASE}/Book/Booking2`
+      },
+      body: body3
+    });
+
+    const html = step3.body;
+
+    // Parse time slots
+    const slots = [];
+    // Match all time slots: timeidx + time text + disabled status
+    const slotRegex = /<input([^>]*?)timeidx="(\d+)"([^>]*?)>[\s\S]*?<span[^>]*timeidx="\d+"[^>]*>\s*([\d:]+\s*[AP]M)\s*<\/span>/gi;
+    let match;
+    while ((match = slotRegex.exec(html)) !== null) {
+      const before = match[1] + match[3];
+      const timeidx = parseInt(match[2]);
+      const timeText = match[4].trim();
+      const isDisabled = before.includes('disabled');
+
+      // Get reason if disabled
+      let reason = null;
+      if (isDisabled) {
+        const spanMatch = html.substring(match.index, match.index + 500).match(/title="([^"]+)"/);
+        reason = spanMatch ? spanMatch[1] : 'Unavailable';
+      }
+
+      slots.push({
+        timeidx,
+        time: timeText,
+        available: !isDisabled,
+        reason: isDisabled ? reason : null
+      });
+    }
+
+    // Simpler fallback regex if above doesn't match
+    if (slots.length === 0) {
+      const simpleRegex = /timeidx="(\d+)"[\s\S]{0,200}?(\d{1,2}:\d{2}\s*[AP]M)/gi;
+      const disabledIdxRegex = /<input disabled[^>]+timeidx="(\d+)"/gi;
+      const disabledSet = new Set();
+      let dm;
+      while ((dm = disabledIdxRegex.exec(html)) !== null) {
+        disabledSet.add(parseInt(dm[1]));
+      }
+      let sm;
+      while ((sm = simpleRegex.exec(html)) !== null) {
+        const idx = parseInt(sm[1]);
+        slots.push({
+          timeidx: idx,
+          time: sm[2].trim(),
+          available: !disabledSet.has(idx),
+          reason: disabledSet.has(idx) ? 'Unavailable' : null
+        });
+      }
+    }
+
+    console.log(`✅ Found ${slots.length} time slots (${slots.filter(s=>s.available).length} available)`);
+    return slots;
+
+  } catch (err) {
+    console.error('❌ Availability scrape error:', err.message);
+    return null;
+  }
+}
+
+
 app.get('/', (req, res) => {
   res.json({
     name: 'Milano Nail Spa Booking API',
@@ -311,6 +601,50 @@ app.get('/api/services', async (req, res) => {
 });
 
 // ==========================================
+// GET /api/closed-dates — ngày nghỉ lễ từ ATSoft
+// ==========================================
+app.get('/api/closed-dates', async (req, res) => {
+  try {
+    const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)';
+    const step1 = await fetchUrl(`${ATSOFT_BASE}/Book/${STORE_ID}`, {
+      headers: { 'User-Agent': UA, 'Accept': 'text/html' }
+    });
+    const cookies1 = (step1.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
+    const csrf1Match = step1.body.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/);
+    if (!csrf1Match) return res.json({ success: true, data: [] });
+
+    const body2 = `__RequestVerificationToken=${encodeURIComponent(csrf1Match[1])}&SelectedEmployeeLocalID=0&SelectedServices=1`;
+    const step2 = await fetchUrl(`${ATSOFT_BASE}/Book/Booking2`, {
+      method: 'POST',
+      headers: {
+        'User-Agent': UA,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Cookie': cookies1
+      },
+      body: body2
+    });
+
+    // Parse disabled dates from flatpickr JS
+    const html = step2.body;
+    const disabledDates = [];
+    const dateRegex = /disabledDates\.push\(new Date\('([^']+)'\)\)/g;
+    let dm;
+    while ((dm = dateRegex.exec(html)) !== null) {
+      // Convert "7/4/2026 12:00:00 AM" → "2026-07-04"
+      const d = new Date(dm[1]);
+      if (!isNaN(d)) {
+        const iso = d.toISOString().split('T')[0];
+        if (!disabledDates.includes(iso)) disabledDates.push(iso);
+      }
+    }
+
+    res.json({ success: true, data: disabledDates });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ==========================================
 // GET /api/availability
 // ==========================================
 app.get('/api/availability', async (req, res) => {
@@ -318,6 +652,7 @@ app.get('/api/availability', async (req, res) => {
     const { date, employeeId } = req.query;
     if (!date) return res.status(400).json({ success: false, error: 'Missing date' });
 
+    // Try SQL first (PC on)
     try {
       const db = await getPool();
       const request = db.request();
@@ -334,10 +669,16 @@ app.get('/api/availability', async (req, res) => {
       const result = await request.query(query);
       return res.json({ success: true, source: 'sql', data: result.recordset });
     } catch (sqlErr) {
-      console.log('⚠️ SQL unavailable for availability, returning empty');
+      console.log('⚠️ SQL unavailable, scraping ATSoft...');
     }
 
-    // Fallback: trả về rỗng (ATSoft tự quản lý availability)
+    // Fallback: scrape from ATSoft HTML
+    const slots = await scrapeAvailabilityFromATSoft(date, employeeId || 0);
+    if (slots && slots.length > 0) {
+      return res.json({ success: true, source: 'atsoft-html', data: slots });
+    }
+
+    // Last fallback: return empty (let frontend handle)
     res.json({ success: true, source: 'fallback', data: [] });
 
   } catch (err) {
