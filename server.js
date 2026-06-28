@@ -254,7 +254,7 @@ async function fetchUrlFull(url, options = {}, maxRedirects = 3) {
 async function scrapeAvailabilityFromATSoft(date, employeeId) {
   console.log(`🔍 Scraping availability: date=${date} empId=${employeeId}`);
   try {
-    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15';
 
     // Step 1: GET /Book/STORE_ID
     const step1 = await fetchUrlFull(`${ATSOFT_BASE}/Book/${STORE_ID}`, {
@@ -262,13 +262,18 @@ async function scrapeAvailabilityFromATSoft(date, employeeId) {
     });
     console.log(`  Step1 status: ${step1.status}`);
 
-    const csrf1 = (step1.body.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/) || [])[1];
-    if (!csrf1) { console.log('  ❌ No CSRF token in step1'); return null; }
-    console.log(`  ✅ CSRF1 found (${csrf1.length} chars)`);
+    const csrf1Match = step1.body.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/);
+    if (!csrf1Match) { console.log('  ❌ No CSRF token in step1'); return null; }
+    const csrf1 = csrf1Match[1];
+    console.log(`  ✅ CSRF1 found`);
 
-    // Step 2: POST employee selection → /Book/Booking2
+    // Extract employee service form data (pick first service available, default to 1)
+    const serviceMatch = step1.body.match(/name="SelectedServices"[^>]+value="(\d+)"/);
+    const serviceId = serviceMatch ? serviceMatch[1] : '1';
+
+    // Step 2: POST employee + service selection → /Book/Booking2
     const empId = parseInt(employeeId) || 0;
-    const body2 = `__RequestVerificationToken=${encodeURIComponent(csrf1)}&SelectedEmployeeLocalID=${empId}`;
+    const body2 = `__RequestVerificationToken=${encodeURIComponent(csrf1)}&SelectedEmployeeLocalID=${empId}&SelectedServices=${serviceId}`;
     const step2 = await fetchUrlFull(`${ATSOFT_BASE}/Book/Booking2`, {
       method: 'POST',
       headers: {
@@ -279,10 +284,11 @@ async function scrapeAvailabilityFromATSoft(date, employeeId) {
       },
       body: body2
     });
-    console.log(`  Step2 status: ${step2.status}, body length: ${step2.body.length}`);
+    console.log(`  Step2 status: ${step2.status}`);
 
-    const csrf2 = (step2.body.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/) || [])[1];
-    if (!csrf2) { console.log('  ❌ No CSRF token in step2'); return null; }
+    const csrf2Match = step2.body.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/);
+    if (!csrf2Match) { console.log('  ❌ No CSRF token in step2'); return null; }
+    const csrf2 = csrf2Match[1];
     console.log(`  ✅ CSRF2 found`);
 
     // Step 3: POST date → /Book/Booking3
@@ -299,48 +305,61 @@ async function scrapeAvailabilityFromATSoft(date, employeeId) {
       },
       body: body3
     });
-    console.log(`  Step3 status: ${step3.status}, body length: ${step3.body.length}`);
+    console.log(`  Step3 status: ${step3.status}`);
 
     const html = step3.body;
-    if (!html.includes('timeidx')) {
-      console.log('  ❌ No timeidx found in step3 response');
-      console.log('  Preview:', html.substring(0, 500));
-      return null;
-    }
 
-    // Parse time slots
+    // Parse time slots (Primary Regex)
     const slots = [];
-    const disabledIdxs = new Set();
-    const disabledReasons = {};
+    const slotRegex = /<input([^>]*?)timeidx="(\d+)"([^>]*?)>[\s\S]*?<span[^>]*timeidx="\d+"[^>]*>\s*([\d:]+\s*[AP]M)\s*<\/span>/gi;
+    let match;
+    
+    while ((match = slotRegex.exec(html)) !== null) {
+      const before = match[1] + match[3];
+      const timeidx = parseInt(match[2]);
+      const timeText = match[4].trim();
+      const isDisabled = before.includes('disabled');
 
-    // Find disabled inputs
-    const disRe = /<input\s+disabled[^>]*timeidx="(\d+)"[^>]*>[\s\S]{0,300}?title="([^"]+)"/gi;
-    let dm;
-    while ((dm = disRe.exec(html)) !== null) {
-      const idx = parseInt(dm[1]);
-      disabledIdxs.add(idx);
-      disabledReasons[idx] = dm[2];
-    }
+      let reason = null;
+      if (isDisabled) {
+        const spanMatch = html.substring(match.index, match.index + 500).match(/title="([^"]+)"/);
+        reason = spanMatch ? spanMatch[1] : 'Unavailable';
+      }
 
-    // Also catch disabled without title
-    const disRe2 = /<input\s+disabled[^>]*timeidx="(\d+)"/gi;
-    while ((dm = disRe2.exec(html)) !== null) {
-      disabledIdxs.add(parseInt(dm[1]));
-    }
-
-    // Find all time slot texts
-    const timeRe = /timeidx="(\d+)"[^>]*>\s*([\d:]+\s*[AP]M)\s*</gi;
-    const seen = new Set();
-    while ((dm = timeRe.exec(html)) !== null) {
-      const idx = parseInt(dm[1]);
-      if (seen.has(idx)) continue;
-      seen.add(idx);
       slots.push({
-        timeidx: idx,
-        time: dm[2].trim(),
-        available: !disabledIdxs.has(idx),
-        reason: disabledReasons[idx] || null
+        timeidx,
+        time: timeText,
+        available: !isDisabled,
+        reason: isDisabled ? reason : null
       });
+    }
+
+    // Fallback parsing if primary regex fails
+    if (slots.length === 0) {
+      console.log('  ⚠️ Using fallback regex parser...');
+      const simpleRegex = /timeidx="(\d+)"[^>]*>\s*([\d:]+\s*[AP]M)\s*</gi;
+      const disabledIdxRegex = /<input\s+disabled[^>]*timeidx="(\d+)"/gi;
+      const disabledSet = new Set();
+      
+      let dm;
+      while ((dm = disabledIdxRegex.exec(html)) !== null) {
+        disabledSet.add(parseInt(dm[1]));
+      }
+      
+      let sm;
+      const seen = new Set();
+      while ((sm = simpleRegex.exec(html)) !== null) {
+        const idx = parseInt(sm[1]);
+        if (seen.has(idx)) continue;
+        seen.add(idx);
+        
+        slots.push({
+          timeidx: idx,
+          time: sm[2].trim(),
+          available: !disabledSet.has(idx),
+          reason: disabledSet.has(idx) ? 'Unavailable' : null
+        });
+      }
     }
 
     console.log(`  ✅ Parsed ${slots.length} slots, ${slots.filter(s=>!s.available).length} taken`);
@@ -374,128 +393,6 @@ app.get('/api/debug-availability', async (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
-
-
-  console.log(`🔍 Scraping availability for date=${date} employeeId=${employeeId}`);
-
-  try {
-    const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15';
-
-    // Step 1: GET /Book/498 → lấy session cookie + CSRF token
-    const step1 = await fetchUrl(`${ATSOFT_BASE}/Book/${STORE_ID}`, {
-      headers: { 'User-Agent': UA, 'Accept': 'text/html' }
-    });
-
-    // Extract session cookie
-    const cookies1 = (step1.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
-
-    // Extract CSRF token
-    const csrfMatch = step1.body.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/);
-    if (!csrfMatch) throw new Error('Cannot find CSRF token in step 1');
-    const csrf1 = csrfMatch[1];
-
-    // Extract employee service form data (pick first service available)
-    const serviceMatch = step1.body.match(/name="SelectedServices"[^>]+value="(\d+)"/);
-    const serviceId = serviceMatch ? serviceMatch[1] : '1';
-
-    // Step 2: POST technician + service selection → /Book/Booking2
-    const body2 = `__RequestVerificationToken=${encodeURIComponent(csrf1)}&SelectedEmployeeLocalID=${employeeId || 0}&SelectedServices=${serviceId}`;
-    const step2 = await fetchUrl(`${ATSOFT_BASE}/Book/Booking2`, {
-      method: 'POST',
-      headers: {
-        'User-Agent': UA,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Cookie': cookies1,
-        'Referer': `${ATSOFT_BASE}/Book/${STORE_ID}`
-      },
-      body: body2
-    });
-
-    const cookies2 = [
-      cookies1,
-      ...(step2.headers['set-cookie'] || []).map(c => c.split(';')[0])
-    ].join('; ');
-
-    // Extract CSRF token from step 2
-    const csrf2Match = step2.body.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/);
-    if (!csrf2Match) throw new Error('Cannot find CSRF token in step 2');
-    const csrf2 = csrf2Match[1];
-
-    // Format date for ATSoft (MM/DD/YYYY)
-    const [y, m, d] = date.split('-');
-    const atsoftDate = `${m}/${d}/${y}`;
-
-    // Step 3: POST date → /Book/Booking3
-    const body3 = `__RequestVerificationToken=${encodeURIComponent(csrf2)}&SelectedDate=${encodeURIComponent(atsoftDate)}`;
-    const step3 = await fetchUrl(`${ATSOFT_BASE}/Book/Booking3`, {
-      method: 'POST',
-      headers: {
-        'User-Agent': UA,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Cookie': cookies2,
-        'Referer': `${ATSOFT_BASE}/Book/Booking2`
-      },
-      body: body3
-    });
-
-    const html = step3.body;
-
-    // Parse time slots
-    const slots = [];
-    // Match all time slots: timeidx + time text + disabled status
-    const slotRegex = /<input([^>]*?)timeidx="(\d+)"([^>]*?)>[\s\S]*?<span[^>]*timeidx="\d+"[^>]*>\s*([\d:]+\s*[AP]M)\s*<\/span>/gi;
-    let match;
-    while ((match = slotRegex.exec(html)) !== null) {
-      const before = match[1] + match[3];
-      const timeidx = parseInt(match[2]);
-      const timeText = match[4].trim();
-      const isDisabled = before.includes('disabled');
-
-      // Get reason if disabled
-      let reason = null;
-      if (isDisabled) {
-        const spanMatch = html.substring(match.index, match.index + 500).match(/title="([^"]+)"/);
-        reason = spanMatch ? spanMatch[1] : 'Unavailable';
-      }
-
-      slots.push({
-        timeidx,
-        time: timeText,
-        available: !isDisabled,
-        reason: isDisabled ? reason : null
-      });
-    }
-
-    // Simpler fallback regex if above doesn't match
-    if (slots.length === 0) {
-      const simpleRegex = /timeidx="(\d+)"[\s\S]{0,200}?(\d{1,2}:\d{2}\s*[AP]M)/gi;
-      const disabledIdxRegex = /<input disabled[^>]+timeidx="(\d+)"/gi;
-      const disabledSet = new Set();
-      let dm;
-      while ((dm = disabledIdxRegex.exec(html)) !== null) {
-        disabledSet.add(parseInt(dm[1]));
-      }
-      let sm;
-      while ((sm = simpleRegex.exec(html)) !== null) {
-        const idx = parseInt(sm[1]);
-        slots.push({
-          timeidx: idx,
-          time: sm[2].trim(),
-          available: !disabledSet.has(idx),
-          reason: disabledSet.has(idx) ? 'Unavailable' : null
-        });
-      }
-    }
-
-    console.log(`✅ Found ${slots.length} time slots (${slots.filter(s=>s.available).length} available)`);
-    return slots;
-
-  } catch (err) {
-    console.error('❌ Availability scrape error:', err.message);
-    return null;
-  }
-}
-
 
 app.get('/', (req, res) => {
   res.json({
