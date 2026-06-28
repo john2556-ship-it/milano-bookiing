@@ -256,7 +256,7 @@ async function scrapeAvailabilityFromATSoft(date, employeeId) {
     const atsoftDate = `${m}/${d}/${y}`;
 
     // Step 3: POST date → /Book/Booking3
-    const body3 = `__RequestVerificationToken=${encodeURIComponent(csrf2)}&AppointmentDate=${encodeURIComponent(atsoftDate)}`;
+    const body3 = `__RequestVerificationToken=${encodeURIComponent(csrf2)}&SelectedDate=${encodeURIComponent(atsoftDate)}`;
     const step3 = await fetchUrl(`${ATSOFT_BASE}/Book/Booking3`, {
       method: 'POST',
       headers: {
@@ -425,6 +425,50 @@ app.get('/api/services', async (req, res) => {
     const services = await scrapeServicesFromHTML();
     res.json({ success: true, source: 'atsoft-html', data: services });
 
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ==========================================
+// GET /api/closed-dates — ngày nghỉ lễ từ ATSoft
+// ==========================================
+app.get('/api/closed-dates', async (req, res) => {
+  try {
+    const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)';
+    const step1 = await fetchUrl(`${ATSOFT_BASE}/Book/${STORE_ID}`, {
+      headers: { 'User-Agent': UA, 'Accept': 'text/html' }
+    });
+    const cookies1 = (step1.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
+    const csrf1Match = step1.body.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/);
+    if (!csrf1Match) return res.json({ success: true, data: [] });
+
+    const body2 = `__RequestVerificationToken=${encodeURIComponent(csrf1Match[1])}&SelectedEmployeeLocalID=0&SelectedServices=1`;
+    const step2 = await fetchUrl(`${ATSOFT_BASE}/Book/Booking2`, {
+      method: 'POST',
+      headers: {
+        'User-Agent': UA,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Cookie': cookies1
+      },
+      body: body2
+    });
+
+    // Parse disabled dates from flatpickr JS
+    const html = step2.body;
+    const disabledDates = [];
+    const dateRegex = /disabledDates\.push\(new Date\('([^']+)'\)\)/g;
+    let dm;
+    while ((dm = dateRegex.exec(html)) !== null) {
+      // Convert "7/4/2026 12:00:00 AM" → "2026-07-04"
+      const d = new Date(dm[1]);
+      if (!isNaN(d)) {
+        const iso = d.toISOString().split('T')[0];
+        if (!disabledDates.includes(iso)) disabledDates.push(iso);
+      }
+    }
+
+    res.json({ success: true, data: disabledDates });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
