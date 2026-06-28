@@ -1,0 +1,17 @@
+{
+  "name": "milano-booking-api",
+  "version": "3.0.0",
+  "description": "Milano Nail Spa Elyson Booking API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "mssql": "^10.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
