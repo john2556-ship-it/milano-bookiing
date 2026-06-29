@@ -300,8 +300,13 @@ async function scrapeAvailabilityFromATSoft(date, employeeId, serviceIds) {
     const params2 = new URLSearchParams();
     state1.forEach(s => params2.append(s.name, s.value));
     params2.append('SelectedEmployeeLocalID', empId);
-    if (serviceIds && serviceIds.length > 0) {
-      serviceIds.forEach(id => params2.append('SelectedServices', id));
+    // Always use ATSoft's real service IDs (frontend IDs like 1,2,3 are NOT ATSoft IDs)
+    // Scrape all available services from ATSoft HTML and use first one for nofit calculation
+    const allSvcMatches = [...step1.body.matchAll(/name="SelectedServices"[^>]+value="(\d+)"/g)];
+    if (allSvcMatches.length > 0) {
+      // Use first service from ATSoft (gives ATSoft a valid duration for nofit calc)
+      params2.append('SelectedServices', allSvcMatches[0][1]);
+      console.log(`  Using ATSoft serviceId: ${allSvcMatches[0][1]} (of ${allSvcMatches.length} available)`);
     } else {
       params2.append('SelectedServices', serviceId);
     }
