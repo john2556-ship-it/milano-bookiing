@@ -303,12 +303,14 @@ async function scrapeAvailabilityFromATSoft(date, employeeId, serviceIds) {
     // Always use ATSoft's real service IDs (frontend IDs like 1,2,3 are NOT ATSoft IDs)
     // Scrape all available services from ATSoft HTML and use first one for nofit calculation
     const allSvcMatches = [...step1.body.matchAll(/name="SelectedServices"[^>]+value="(\d+)"/g)];
-    if (allSvcMatches.length > 0) {
-      // Use first service from ATSoft (gives ATSoft a valid duration for nofit calc)
-      params2.append('SelectedServices', allSvcMatches[0][1]);
-      console.log(`  Using ATSoft serviceId: ${allSvcMatches[0][1]} (of ${allSvcMatches.length} available)`);
+    const atsoftSvcIds = allSvcMatches.map(m => m[1]);
+    if (atsoftSvcIds.length > 0) {
+      // Pass ALL services — ATSoft picks the longest duration for nofit calculation
+      atsoftSvcIds.forEach(id => params2.append('SelectedServices', id));
+      console.log(`  Using ALL ATSoft serviceIds: ${atsoftSvcIds.join(',')} (${atsoftSvcIds.length} services)`);
     } else {
       params2.append('SelectedServices', serviceId);
+      console.log(`  Fallback serviceId: ${serviceId}`);
     }
 
     // Step 2: POST employee + service selection → /Book/Booking2
@@ -419,14 +421,20 @@ app.get('/api/debug-availability', async (req, res) => {
   const sids = services ? services.toString().split(',').map(s=>s.trim()).filter(Boolean) : [];
   try {
     const slots = await scrapeAvailabilityFromATSoft(d, e, sids);
+    // Also show what ATSoft services were found
+    const step1test = await fetchUrlFull(`${ATSOFT_BASE}/Book/${STORE_ID}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/html' }
+    });
+    const svcIds = [...step1test.body.matchAll(/name="SelectedServices"[^>]+value="(\d+)"/g)].map(m=>m[1]);
     res.json({
       success: true,
       date: d,
       employeeId: e,
+      atsoft_service_ids: svcIds,
       slots_found: slots ? slots.length : 0,
       taken: slots ? slots.filter(s=>!s.available).length : 0,
-      sample: slots ? slots.slice(0,5) : null,
-      raw_result: slots
+      taken_slots: slots ? slots.filter(s=>!s.available).map(s=>({time:s.time,reason:s.reason})) : [],
+      sample: slots ? slots.slice(0,5) : null
     });
   } catch(err) {
     res.status(500).json({ success: false, error: err.message });
