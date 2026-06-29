@@ -278,8 +278,8 @@ function extractFormState(html) {
 }
 
 // ── Scrape Availability từ ATSoft HTML ──────────────────
-async function scrapeAvailabilityFromATSoft(date, employeeId) {
-  console.log(`🔍 Scraping availability: date=${date} empId=${employeeId}`);
+async function scrapeAvailabilityFromATSoft(date, employeeId, serviceIds) {
+  console.log(`🔍 Scraping availability: date=${date} services=${JSON.stringify(serviceIds)} empId=${employeeId}`);
   try {
     const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15';
 
@@ -300,7 +300,11 @@ async function scrapeAvailabilityFromATSoft(date, employeeId) {
     const params2 = new URLSearchParams();
     state1.forEach(s => params2.append(s.name, s.value));
     params2.append('SelectedEmployeeLocalID', empId);
-    params2.append('SelectedServices', serviceId);
+    if (serviceIds && serviceIds.length > 0) {
+      serviceIds.forEach(id => params2.append('SelectedServices', id));
+    } else {
+      params2.append('SelectedServices', serviceId);
+    }
 
     // Step 2: POST employee + service selection → /Book/Booking2
     const step2 = await fetchUrlFull(`${ATSOFT_BASE}/Book/Booking2`, {
@@ -404,11 +408,12 @@ async function scrapeAvailabilityFromATSoft(date, employeeId) {
 // GET /api/debug-availability — debug only
 // ==========================================
 app.get('/api/debug-availability', async (req, res) => {
-  const { date, employeeId } = req.query;
+  const { date, employeeId, services } = req.query;
   const d = date || new Date().toISOString().split('T')[0];
   const e = employeeId || '0';
+  const sids = services ? services.toString().split(',').map(s=>s.trim()).filter(Boolean) : [];
   try {
-    const slots = await scrapeAvailabilityFromATSoft(d, e);
+    const slots = await scrapeAvailabilityFromATSoft(d, e, sids);
     res.json({
       success: true,
       date: d,
@@ -576,8 +581,9 @@ app.get('/api/closed-dates', async (req, res) => {
 // ==========================================
 app.get('/api/availability', async (req, res) => {
   try {
-    const { date, employeeId } = req.query;
+    const { date, employeeId, services } = req.query;
     if (!date) return res.status(400).json({ success: false, error: 'Missing date' });
+    const serviceIds = services ? services.toString().split(',').map(s=>s.trim()).filter(Boolean) : [];
 
     // Try SQL first (PC on)
     try {
@@ -600,7 +606,7 @@ app.get('/api/availability', async (req, res) => {
     }
 
     // Fallback: scrape from ATSoft HTML
-    const slots = await scrapeAvailabilityFromATSoft(date, employeeId || 0);
+    const slots = await scrapeAvailabilityFromATSoft(date, employeeId || 0, serviceIds);
     if (slots && slots.length > 0) {
       return res.json({ success: true, source: 'atsoft-html', data: slots });
     }
