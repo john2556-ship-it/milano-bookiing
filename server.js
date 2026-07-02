@@ -25,7 +25,7 @@ const allowedOrigins = [
   'https://booking-832.pages.dev',
   'https://milanonailspa529.com',
   'https://www.milanonailspa529.com',
-	'https://booking..milanonailspa529.com',
+	'https://booking.milanonailspa529.com',
 	'https://api.milanonailspa529.com',
   'http://localhost:3000',
   'http://localhost:8080',
