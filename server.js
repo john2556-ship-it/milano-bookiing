@@ -502,7 +502,7 @@ app.post('/api/booking', async (req, res) => {
 function buildDummySlots() {
   const slots = [];
   for (let h = 9; h <= 19; h++) {
-    ['00', '30'].forEach(m => {
+    ['00', '15'].forEach(m => {
       if (h === 19 && m === '30') return;
       const hour12 = h > 12 ? h - 12 : h;
       const ampm   = h >= 12 ? 'PM' : 'AM';
