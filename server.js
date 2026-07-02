@@ -1,680 +1,674 @@
+// ============================================================
+// Milano Nail Spa Booking API — v4.0 (SQL-direct)
+// File: C:\MILANO-BOOK\server.js
+//
+// Setup:
+//   1. npm install express mssql cors dotenv
+//   2. Create .env file (template at bottom of this file)
+//   3. node server.js   (or)   pm2 restart Milano-Booking-API
+//
+// Public URL: https://api.milanonailspa529.com (via Cloudflare Tunnel)
+// ============================================================
+
+require('dotenv').config();
 const express = require('express');
 const sql = require('mssql');
 const cors = require('cors');
-const https = require('https');
-const http = require('http');
 
 const app = express();
+
+// ============================================================
+// CORS — only allow your booking sites
+// To open up during development, replace with: app.use(cors());
+// ============================================================
+const allowedOrigins = [
+  'https://booking-832.pages.dev',
+  'https://milanonailspa529.com',
+  'https://www.milanonailspa529.com',
+	'https://booking..milanonailspa529.com',
+	'https://api.milanonailspa529.com',
+  'http://localhost:3000',
+  'http://localhost:8080',
+  'http://127.0.0.1:5500'  // VS Code Live Server
+];
+
 app.use(cors({
-  origin: [
-    'https://book.milanonailspa529.com',
-    'https://ok.milanonailspa529.com',
-    'https://booking.milanonailspa529.com',
-    'https://milanonailspa529.com',
-    'http://milanonailspaelyson.dvrlists.com',
-    'http://milanonailspaelyson.dvrlists.com:3456',
-    'http://localhost:3456',
-    'http://localhost:3000',
-    'file://'
-  ],
-  credentials: true
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, Postman, curl)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    console.warn(`⚠️  CORS blocked origin: ${origin}`);
+    callback(new Error('Not allowed by CORS'));
+  }
 }));
+
 app.use(express.json());
 
-// ── ATSoft Credentials ──
-const ATSOFT_USERNAME = '0000022222';
-const ATSOFT_PASSWORD = '0000022222';
-const ATSOFT_BASE     = 'https://book.atsoft.com';
-const STORE_ID        = 498;
+// Simple request logger
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
 
-// ── SQL Config (fallback nếu PC bật) ──
+// ============================================================
+// DATABASE CONFIG (credentials from .env)
+// ============================================================
 const dbConfig = {
-  server: '127.0.0.1',
-  database: 'DbProvider',
-  user: 'sa',
-  password: 'atsoft',
-  port: 1433,
-  options: { enableArithAbort: true, trustServerCertificate: true, encrypt: false }
+  server: process.env.DB_SERVER || '127.0.0.1',
+  database: process.env.DB_NAME || 'DbProvider',
+  user: process.env.DB_USER || 'sa',
+  password: process.env.DB_PASSWORD || 'atsoft',
+  port: parseInt(process.env.DB_PORT) || 1433,
+  options: {
+    encrypt: false,
+    trustServerCertificate: true
+  },
+  pool: {
+    max: 10,
+    min: 0,
+    idleTimeoutMillis: 30000
+  }
 };
-let pool = null;
+
+// ============================================================
+// CONNECTION POOL — single shared pool, lazy init with retry
+// ============================================================
+let poolPromise;
+
 async function getPool() {
-  if (!pool) {
-    pool = await sql.connect(dbConfig);
-    console.log('✅ Connected to SQL Server!');
-  }
-  return pool;
-}
-
-// ── ATSoft Session ──
-let atsoftCookie = null;
-let atsoftCookieExpiry = null;
-
-async function fetchUrl(url, options = {}) {
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const lib = urlObj.protocol === 'https:' ? https : http;
-    const reqOptions = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      method: options.method || 'GET',
-      headers: options.headers || {}
-    };
-    const req = lib.request(reqOptions, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
-    });
-    req.on('error', reject);
-    if (options.body) req.write(options.body);
-    req.end();
-  });
-}
-
-async function loginAtsoft() {
-  console.log('🔐 Logging into ATSoft...');
-  const loginRes = await fetchUrl(
-    `${ATSOFT_BASE}/Dashboard/apilogin?username=${ATSOFT_USERNAME}&password=${ATSOFT_PASSWORD}`
-  );
-  const cookies = loginRes.headers['set-cookie'] || [];
-  if (cookies.length > 0) {
-    atsoftCookie = cookies.map(c => c.split(';')[0]).join('; ');
-    atsoftCookieExpiry = Date.now() + (25 * 60 * 1000);
-    console.log('✅ ATSoft login successful!');
-    return true;
-  }
-  console.error('❌ ATSoft login failed - status:', loginRes.status);
-  return false;
-}
-
-async function getAtsoftCookie() {
-  if (!atsoftCookie || Date.now() > atsoftCookieExpiry) {
-    await loginAtsoft();
-  }
-  return atsoftCookie;
-}
-
-// ── Scrape Technicians từ ATSoft HTML ──
-let techCache = null;
-let techCacheExpiry = null;
-
-async function scrapeEmployeesFromHTML() {
-  // Cache 10 phút
-  if (techCache && Date.now() < techCacheExpiry) {
-    console.log('📋 Returning cached technicians');
-    return techCache;
-  }
-
-  console.log('🔍 Scraping technicians from ATSoft HTML...');
-  const res = await fetchUrl(`${ATSOFT_BASE}/Book/${STORE_ID}`, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Accept': 'text/html,application/xhtml+xml'
-    }
-  });
-
-  const html = res.body;
-  const employees = [{ EmployeeID: 0, FullName: 'Anyone', CellPhone: '' }];
-
-  // Parse: techName="HANNAH" type="radio" value="198"
-  const regex = /techName="([^"]+)"\s+type="radio"\s+value="(\d+)"/g;
-  let match;
-  while ((match = regex.exec(html)) !== null) {
-    const name = match[1];
-    const id   = parseInt(match[2]);
-    if (id > 0) {
-      employees.push({ EmployeeID: id, FullName: name, CellPhone: '' });
-    }
-  }
-
-  console.log(`✅ Found ${employees.length} employees from HTML`);
-
-  // Cache kết quả 10 phút
-  techCache = employees;
-  techCacheExpiry = Date.now() + (10 * 60 * 1000);
-
-  return employees;
-}
-
-// ── Scrape Services từ ATSoft HTML ──
-let svcCache = null;
-let svcCacheExpiry = null;
-
-async function scrapeServicesFromHTML() {
-  if (svcCache && Date.now() < svcCacheExpiry) {
-    return svcCache;
-  }
-
-  console.log('🔍 Scraping services from ATSoft HTML...');
-  const res = await fetchUrl(`${ATSOFT_BASE}/Book/${STORE_ID}`, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Accept': 'text/html,application/xhtml+xml'
-    }
-  });
-
-  const html = res.body;
-  const services = [];
-
-  // Parse service categories
-  const catRegex = /data-category-id="(\d+)"[^>]*>([^<]+)</g;
-  let match;
-  while ((match = catRegex.exec(html)) !== null) {
-    services.push({ CategoryID: parseInt(match[1]), CategoryName: match[2].trim() });
-  }
-
-  svcCache = services;
-  svcCacheExpiry = Date.now() + (10 * 60 * 1000);
-  return services;
-}
-
-function formatTime12h(timeStr) {
-  const [h, m] = timeStr.split(':').map(Number);
-  const ampm = h >= 12 ? 'PM' : 'AM';
-  const hour12 = h > 12 ? h - 12 : h === 0 ? 12 : h;
-  return `${hour12}:${String(m).padStart(2,'0')} ${ampm}`;
-}
-
-async function createAtsoftAppointment(data) {
-  const cookie = await getAtsoftCookie();
-  const payload = JSON.stringify({
-    AppointmentDate:  data.appointmentDate,
-    CustomerName:     data.customerName,
-    CustomerPhone:    data.customerPhone,
-    IsBlockOff:       false,
-    SelectedServices: [],
-    TechnicianId:     parseInt(data.employeeId) || 1,
-    TimeStart:        data.timeStart,
-    TimeEnd:          data.timeEnd,
-    StoreId:          STORE_ID,
-    Notes:            data.notes || ''
-  });
-  const res = await fetchUrl(`${ATSOFT_BASE}/api/events/create-appointment`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json, text/javascript, */*; q=0.01',
-      'Cookie': cookie,
-      'Referer': `${ATSOFT_BASE}/Dashboard/Calendar`,
-      'X-Requested-With': 'XMLHttpRequest',
-      'Content-Length': Buffer.byteLength(payload)
-    },
-    body: payload
-  });
-  console.log(`📡 ATSoft: ${res.status} - ${res.body}`);
-  return { status: res.status, body: res.body };
-}
-
-// ── Improved fetchUrl with redirect & cookie support ──────────────
-async function fetchUrlFull(url, options = {}, maxRedirects = 3) {
-  return new Promise((resolve, reject) => {
-    const doRequest = (currentUrl, redirectsLeft, cookieJar) => {
-      const urlObj = new URL(currentUrl);
-      const lib = urlObj.protocol === 'https:' ? https : http;
-      const reqOptions = {
-        hostname: urlObj.hostname,
-        path: urlObj.pathname + urlObj.search,
-        method: options.method || 'GET',
-        headers: { ...options.headers }
-      };
-      if (cookieJar) reqOptions.headers['Cookie'] = cookieJar;
-      const req = lib.request(reqOptions, (res) => {
-        let data = '';
-        
-        // 🛠️ FIX: Properly merge cookies (New cookies overwrite old ones)
-        const cookieMap = new Map();
-        if (cookieJar) {
-          cookieJar.split('; ').forEach(c => {
-            const parts = c.split('=');
-            if (parts.length >= 2) cookieMap.set(parts[0], parts.slice(1).join('='));
-          });
-        }
-        const newCookies = res.headers['set-cookie'] || [];
-        newCookies.forEach(c => {
-          const primary = c.split(';')[0];
-          const parts = primary.split('=');
-          if (parts.length >= 2) cookieMap.set(parts[0], parts.slice(1).join('='));
-        });
-        const allCookies = Array.from(cookieMap.entries())
-          .map(([k, v]) => `${k}=${v}`)
-          .join('; ');
-
-        // Follow redirects
-        if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 303) && redirectsLeft > 0) {
-          const location = res.headers['location'];
-          if (location) {
-            const nextUrl = location.startsWith('http') ? location : `${urlObj.protocol}//${urlObj.hostname}${location}`;
-            res.resume();
-            doRequest(nextUrl, redirectsLeft - 1, allCookies);
-            return;
-          }
-        }
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data, cookies: allCookies }));
+  if (!poolPromise) {
+    poolPromise = sql.connect(dbConfig)
+      .then(pool => {
+        console.log('✅ Connected to SQL Server');
+        return pool;
+      })
+      .catch(err => {
+        console.error('❌ Database connection failed:', err.message);
+        poolPromise = null;  // allow retry on next request
+        throw err;
       });
-      req.on('error', reject);
-      if (options.body) req.write(options.body);
-      req.end();
-    };
-    doRequest(url, maxRedirects, options.headers ? options.headers['Cookie'] : '');
-  });
+  }
+  return poolPromise;
 }
 
-// 🛠️ FIX: Helper to extract hidden ASP.NET tracking state fields
-function extractFormState(html) {
-  const state = [];
-  const regex = /<input[^>]*name=["']([^"']+)["'][^>]*value=["']([^"']*)["']/gi;
-  let match;
-  while ((match = regex.exec(html)) !== null) {
-    const fullTag = match[0].toLowerCase();
-    const name = match[1];
-    const value = match[2];
-    if (fullTag.includes('type="hidden"') || name === '__RequestVerificationToken') {
-      if (!state.find(s => s.name === name)) {
-        state.push({ name, value });
-      }
-    }
-  }
-  return state;
-}
-
-// ── Scrape Availability từ ATSoft HTML ──────────────────
-async function scrapeAvailabilityFromATSoft(date, employeeId, serviceIds) {
-  console.log(`🔍 Scraping availability: date=${date} services=${JSON.stringify(serviceIds)} empId=${employeeId}`);
-  try {
-    const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15';
-
-    // Step 1: GET /Book/STORE_ID
-    const step1 = await fetchUrlFull(`${ATSOFT_BASE}/Book/${STORE_ID}`, {
-      headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml' }
-    });
-    console.log(`  Step1 status: ${step1.status}`);
-
-    const state1 = extractFormState(step1.body);
-    if (state1.length === 0) { console.log('  ❌ No form state found in step1'); return null; }
-
-    const serviceMatch = step1.body.match(/name="SelectedServices"[^>]+value="(\d+)"/);
-    const serviceId = serviceMatch ? serviceMatch[1] : '1';
-    const empId = parseInt(employeeId) || 0;
-
-    // Build Step 2 Body dynamically 
-    const params2 = new URLSearchParams();
-    state1.forEach(s => params2.append(s.name, s.value));
-    params2.append('SelectedEmployeeLocalID', empId);
-    // Always use ATSoft's real service IDs (frontend IDs like 1,2,3 are NOT ATSoft IDs)
-    // Scrape all available services from ATSoft HTML and use first one for nofit calculation
-    const allSvcMatches = [...step1.body.matchAll(/name="SelectedServices"[^>]+value="(\d+)"/g)];
-    const atsoftSvcIds = allSvcMatches.map(m => m[1]);
-    if (atsoftSvcIds.length > 0) {
-      // Pass ALL services — ATSoft picks the longest duration for nofit calculation
-      atsoftSvcIds.forEach(id => params2.append('SelectedServices', id));
-      console.log(`  Using ALL ATSoft serviceIds: ${atsoftSvcIds.join(',')} (${atsoftSvcIds.length} services)`);
-    } else {
-      params2.append('SelectedServices', serviceId);
-      console.log(`  Fallback serviceId: ${serviceId}`);
-    }
-
-    // Step 2: POST employee + service selection → /Book/Booking2
-    const step2 = await fetchUrlFull(`${ATSOFT_BASE}/Book/Booking2`, {
-      method: 'POST',
-      headers: {
-        'User-Agent': UA,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Cookie': step1.cookies,
-        'Referer': `${ATSOFT_BASE}/Book/${STORE_ID}`
-      },
-      body: params2.toString()
-    });
-    console.log(`  Step2 status: ${step2.status}`);
-
-    const state2 = extractFormState(step2.body);
-
-    // Build Step 3 Body dynamically
-    const [y, m, d] = date.split('-');
-    const atsoftDate = `${m}/${d}/${y}`;
-    const params3 = new URLSearchParams();
-    state2.forEach(s => params3.append(s.name, s.value));
-    params3.append('SelectedDate', atsoftDate);
-
-    // Step 3: POST date → /Book/Booking3
-    const step3 = await fetchUrlFull(`${ATSOFT_BASE}/Book/Booking3`, {
-      method: 'POST',
-      headers: {
-        'User-Agent': UA,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Cookie': step2.cookies,
-        'Referer': `${ATSOFT_BASE}/Book/Booking2`
-      },
-      body: params3.toString()
-    });
-    console.log(`  Step3 status: ${step3.status}`);
-
-    const html = step3.body;
-
-    // Parse time slots (Primary Regex)
-    const slots = [];
-    const slotRegex = /<input([^>]*?)timeidx="(\d+)"([^>]*?)>[\s\S]*?<span[^>]*timeidx="\d+"[^>]*>\s*([\d:]+\s*[AP]M)\s*<\/span>/gi;
-    let match;
-    
-    while ((match = slotRegex.exec(html)) !== null) {
-      const before = match[1] + match[3];
-      const timeidx = parseInt(match[2]);
-      const timeText = match[4].trim();
-      const isDisabled = before.includes('disabled');
-
-      let reason = null;
-      if (isDisabled) {
-        const spanMatch = html.substring(match.index, match.index + 500).match(/title="([^"]+)"/);
-        reason = spanMatch ? spanMatch[1] : 'Unavailable';
-      }
-
-      slots.push({
-        timeidx,
-        time: timeText,
-        available: !isDisabled,
-        reason: isDisabled ? reason : null
-      });
-    }
-
-    if (slots.length === 0) {
-      console.log('  ⚠️ Using fallback regex parser...');
-      const simpleRegex = /timeidx="(\d+)"[^>]*>\s*([\d:]+\s*[AP]M)\s*</gi;
-      const disabledIdxRegex = /<input[^>]*disabled[^>]*timeidx="(\d+)"/gi;
-      const disabledSet = new Set();
-      
-      let dm;
-      while ((dm = disabledIdxRegex.exec(html)) !== null) {
-        disabledSet.add(parseInt(dm[1]));
-      }
-      
-      let sm;
-      const seen = new Set();
-      while ((sm = simpleRegex.exec(html)) !== null) {
-        const idx = parseInt(sm[1]);
-        if (seen.has(idx)) continue;
-        seen.add(idx);
-        
-        slots.push({
-          timeidx: idx,
-          time: sm[2].trim(),
-          available: !disabledSet.has(idx),
-          reason: disabledSet.has(idx) ? 'Unavailable' : null
-        });
-      }
-    }
-
-    console.log(`  ✅ Parsed ${slots.length} slots, ${slots.filter(s=>!s.available).length} taken`);
-    return slots.length > 0 ? slots : null;
-
-  } catch (err) {
-    console.error('❌ scrapeAvailability error:', err.message);
-    return null;
-  }
-}
-
-// ==========================================
-// GET /api/debug-availability — debug only
-// ==========================================
-app.get('/api/debug-availability', async (req, res) => {
-  const { date, employeeId, services } = req.query;
-  const d = date || new Date().toISOString().split('T')[0];
-  const e = employeeId || '0';
-  const sids = services ? services.toString().split(',').map(s=>s.trim()).filter(Boolean) : [];
-  try {
-    const slots = await scrapeAvailabilityFromATSoft(d, e, sids);
-    // Also show what ATSoft services were found
-    const step1test = await fetchUrlFull(`${ATSOFT_BASE}/Book/${STORE_ID}`, {
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/html' }
-    });
-    const svcIds = [...step1test.body.matchAll(/name="SelectedServices"[^>]+value="(\d+)"/g)].map(m=>m[1]);
-    res.json({
-      success: true,
-      date: d,
-      employeeId: e,
-      atsoft_service_ids: svcIds,
-      slots_found: slots ? slots.length : 0,
-      taken: slots ? slots.filter(s=>!s.available).length : 0,
-      taken_slots: slots ? slots.filter(s=>!s.available).map(s=>({time:s.time,reason:s.reason})) : [],
-      sample: slots ? slots.slice(0,5) : null
-    });
-  } catch(err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.get('/', (req, res) => {
-  res.json({
-    name: 'Milano Nail Spa Booking API',
-    version: '3.0',
-    mode: 'Cloud — No PC required!',
-    routes: [
-      'GET  /api/health',
-      'GET  /api/employees',
-      'GET  /api/technicians (alias)',
-      'GET  /api/services',
-      'GET  /api/closed-dates',
-      'GET  /api/availability?date=YYYY-MM-DD&employeeId=0',
-      'POST /api/booking'
-    ]
-  });
-});
-
-// ==========================================
-// GET /api/health
-// ==========================================
+// ============================================================
+// HEALTH CHECK
+// ============================================================
 app.get('/api/health', (req, res) => {
-  res.json({ success: true, message: 'Milano Booking API v3.0 running!', time: new Date() });
+  res.json({
+    success: true,
+    message: 'Milano Booking API v4.0 running',
+    timestamp: new Date().toISOString()
+  });
 });
 
-// ==========================================
-// GET /api/employees — scrape từ ATSoft HTML
-// ==========================================
+// ============================================================
+// GET /api/employees — list of active technicians
+// ============================================================
 app.get('/api/employees', async (req, res) => {
   try {
-    // Thử SQL trước (nếu PC bật)
-    try {
-      const db = await getPool();
-      const result = await db.request().query(`
-        SELECT EmployeeID, FullName, CellPhone
-        FROM dbo.Employees WHERE Active = 1 AND IsOnline = 1 ORDER BY FullName
-      `);
-      return res.json({ success: true, source: 'sql', data: [
-        { EmployeeID: 0, FullName: 'Anyone', CellPhone: '' },
-        ...result.recordset
-      ]});
-    } catch (sqlErr) {
-      console.log('⚠️ SQL unavailable, scraping ATSoft HTML...');
-    }
-
-    // Fallback: scrape từ ATSoft HTML
-    const employees = await scrapeEmployeesFromHTML();
-    res.json({ success: true, source: 'atsoft-html', data: employees });
-
+    const pool = await getPool();
+    const result = await pool.request()
+      .query('SELECT EmployeeID, FullName FROM Employees WHERE Active = 1 ORDER BY FullName');
+    res.json({ success: true, data: result.recordset });
   } catch (err) {
+    console.error('GET /api/employees error:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ==========================================
-// GET /api/technicians — alias
-// ==========================================
-app.get('/api/technicians', async (req, res) => {
+// ============================================================
+// GET /api/available-techs?date=YYYY-MM-DD
+// Returns only technicians who work on that day-of-week AND aren't on vacation.
+// Useful for a "Date first, then Technician" booking flow.
+// ============================================================
+app.get('/api/available-techs', async (req, res) => {
+  const { date } = req.query;
+
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ success: false, error: 'Missing or invalid date (YYYY-MM-DD)' });
+  }
+
   try {
-    try {
-      const db = await getPool();
-      const result = await db.request().query(`
-        SELECT EmployeeID, FullName, CellPhone
-        FROM dbo.Employees WHERE Active = 1 AND IsOnline = 1 ORDER BY FullName
+    const pool = await getPool();
+    // Day of week: 0=Sun ... 6=Sat, matches ATSoft's WorkDays bitmask
+    const dayOfWeek = new Date(date + 'T12:00:00').getDay();
+    const mask = 1 << dayOfWeek;
+
+    // WorkDays bit is set AND (no vacation OR vacation window doesn't cover this date)
+    const result = await pool.request()
+      .input('mask', sql.Int, mask)
+      .input('date', sql.Date, date)
+      .query(`
+        SELECT EmployeeID, FullName
+        FROM Employees
+        WHERE Active = 1
+          AND (WorkDays & @mask) <> 0
+          AND (
+            DayOffStart IS NULL
+            OR DayOffEnded IS NULL
+            OR YEAR(DayOffStart) < 2015   -- ATSoft sentinel dates
+            OR CAST(@date AS DATE) < CAST(DayOffStart AS DATE)
+            OR CAST(@date AS DATE) > CAST(DayOffEnded AS DATE)
+          )
+        ORDER BY FullName
       `);
-      return res.json({ success: true, source: 'sql', data: [
-        { EmployeeID: 0, FullName: 'Anyone', CellPhone: '' },
-        ...result.recordset
-      ]});
-    } catch (sqlErr) {
-      console.log('⚠️ SQL unavailable, scraping ATSoft HTML...');
-    }
 
-    const employees = await scrapeEmployeesFromHTML();
-    res.json({ success: true, source: 'atsoft-html', data: employees });
-
+    res.json({ success: true, date, dayOfWeek, count: result.recordset.length, data: result.recordset });
   } catch (err) {
+    console.error('GET /api/available-techs error:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ==========================================
-// GET /api/services
-// ==========================================
+// ============================================================
+// GET /api/services — list of available services
+// Booking form expects fields: CategoryName, ProductKey, Price
+// ProductKey categorizes the item (PED/MAN/WAX/KID/DIP/ART/POL/GX/SET/HAN).
+// ATSoft's Products.CategoryName column is usually empty — we alias ProductName
+// so the frontend has something to display. IsOnline = 1 filters to bookable items.
+// ============================================================
 app.get('/api/services', async (req, res) => {
   try {
-    try {
-      const db = await getPool();
-      const result = await db.request().query(`
-        SELECT CategoryID, CategoryName, ProductKey
-        FROM dbo.Categories ORDER BY Page, Row
-      `);
-      return res.json({ success: true, source: 'sql', data: result.recordset });
-    } catch (sqlErr) {
-      console.log('⚠️ SQL unavailable, scraping ATSoft HTML...');
-    }
-
-    const services = await scrapeServicesFromHTML();
-    res.json({ success: true, source: 'atsoft-html', data: services });
-
+    const pool = await getPool();
+    const result = await pool.request().query(`
+      SELECT
+        ProductID,
+        ProductKey,
+        ProductName AS CategoryName,
+        Price
+      FROM Products
+      WHERE IsOnline = 1
+        AND (RecordState IS NULL OR RecordState <> 9)
+        AND ProductName IS NOT NULL
+        AND LTRIM(RTRIM(ProductName)) <> ''
+      ORDER BY ProductKey, ProductName
+    `);
+    res.json({ success: true, source: 'sql', count: result.recordset.length, data: result.recordset });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    console.error('GET /api/services error:', err.message);
+    // Fall back to a curated menu using field names the booking form expects
+    res.json({
+      success: true,
+      data: getFallbackServices(),
+      source: 'fallback',
+      warning: err.message
+    });
   }
 });
 
-// ==========================================
-// GET /api/closed-dates — ngày nghỉ lễ từ ATSoft
-// ==========================================
-app.get('/api/closed-dates', async (req, res) => {
-  try {
-    const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)';
-    const step1 = await fetchUrl(`${ATSOFT_BASE}/Book/${STORE_ID}`, {
-      headers: { 'User-Agent': UA, 'Accept': 'text/html' }
-    });
-    const cookies1 = (step1.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
-    const csrf1Match = step1.body.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/);
-    if (!csrf1Match) return res.json({ success: true, data: [] });
+// Fallback menu — matches the field names the booking form uses.
+// ProductKey drives the category label (see getCatLabel in booking.html).
+function getFallbackServices() {
+  return [
+    // Manicures
+    { ProductKey: 'MAN01', CategoryName: 'Classic Manicure',     Price: 25 },
+    { ProductKey: 'MAN02', CategoryName: 'Gel Manicure',         Price: 40 },
+    { ProductKey: 'MAN03', CategoryName: 'French Manicure',      Price: 35 },
+    // Pedicures
+    { ProductKey: 'PED01', CategoryName: 'Classic Pedicure',     Price: 35 },
+    { ProductKey: 'PED02', CategoryName: 'Gel Pedicure',         Price: 50 },
+    { ProductKey: 'PED03', CategoryName: 'Deluxe Spa Pedicure',  Price: 55 },
+    { ProductKey: 'PED04', CategoryName: 'Milano Signature Pedicure', Price: 75 },
+    // Full Set
+    { ProductKey: 'SET01', CategoryName: 'Acrylic Full Set',     Price: 55 },
+    { ProductKey: 'SET02', CategoryName: 'Gel-X Full Set',       Price: 65 },
+    { ProductKey: 'GX01',  CategoryName: 'Ombre Full Set',       Price: 70 },
+    // Dip Powder
+    { ProductKey: 'DIP01', CategoryName: 'Dip Powder',           Price: 50 },
+    { ProductKey: 'DIP02', CategoryName: 'Dip with Tips',        Price: 60 },
+    // Waxing
+    { ProductKey: 'WAX01', CategoryName: 'Eyebrow Wax',          Price: 12 },
+    { ProductKey: 'WAX02', CategoryName: 'Lip Wax',              Price: 8  },
+    { ProductKey: 'WAX03', CategoryName: 'Chin Wax',             Price: 10 },
+    // Nail Art
+    { ProductKey: 'ART01', CategoryName: 'Nail Art (per nail)',  Price: 5  },
+    { ProductKey: 'ART02', CategoryName: 'Chrome Design',        Price: 15 },
+    // Polish Change
+    { ProductKey: 'POL01', CategoryName: 'Polish Change - Hands', Price: 12 },
+    { ProductKey: 'POL02', CategoryName: 'Polish Change - Feet',  Price: 15 },
+    // Kids
+    { ProductKey: 'KID01', CategoryName: 'Kids Manicure',        Price: 15 },
+    { ProductKey: 'KID02', CategoryName: 'Kids Pedicure',        Price: 20 }
+  ];
+}
 
-    const body2 = `__RequestVerificationToken=${encodeURIComponent(csrf1Match[1])}&SelectedEmployeeLocalID=0&SelectedServices=1`;
-    const step2 = await fetchUrl(`${ATSOFT_BASE}/Book/Booking2`, {
-      method: 'POST',
-      headers: {
-        'User-Agent': UA,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Cookie': cookies1
-      },
-      body: body2
-    });
-
-    // Parse disabled dates from flatpickr JS
-    const html = step2.body;
-    const disabledDates = [];
-    const dateRegex = /disabledDates\.push\(new Date\('([^']+)'\)\)/g;
-    let dm;
-    while ((dm = dateRegex.exec(html)) !== null) {
-      // Convert "7/4/2026 12:00:00 AM" → "2026-07-04"
-      const d = new Date(dm[1]);
-      if (!isNaN(d)) {
-        const iso = d.toISOString().split('T')[0];
-        if (!disabledDates.includes(iso)) disabledDates.push(iso);
-      }
-    }
-
-    res.json({ success: true, data: disabledDates });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ==========================================
-// GET /api/availability
-// ==========================================
+// ============================================================
+// GET /api/availability — booked time slots for a tech on a date
+// ============================================================
 app.get('/api/availability', async (req, res) => {
-  try {
-    const { date, employeeId, services } = req.query;
-    if (!date) return res.status(400).json({ success: false, error: 'Missing date' });
-    const serviceIds = services ? services.toString().split(',').map(s=>s.trim()).filter(Boolean) : [];
+  const { date, employeeId } = req.query;
 
-    // Try SQL first (PC on)
-    try {
-      const db = await getPool();
-      const request = db.request();
-      request.input('date', sql.Date, date);
-      let query = `
-        SELECT OnTime, EmployeeName, Services, StatusStr
-        FROM dbo.Appointments
-        WHERE CAST(OnDate AS DATE) = @date AND StatusStr != 'Cancelled'
-      `;
-      if (employeeId && employeeId !== '0') {
-        request.input('empId', sql.Int, parseInt(employeeId));
-        query += ` AND EmployeeID = @empId`;
-      }
-      const result = await request.query(query);
-      return res.json({ success: true, source: 'sql', data: result.recordset });
-    } catch (sqlErr) {
-      console.log('⚠️ SQL unavailable, scraping ATSoft...');
-    }
-
-    // Fallback: scrape from ATSoft HTML
-    const slots = await scrapeAvailabilityFromATSoft(date, employeeId || 0, serviceIds);
-    if (slots && slots.length > 0) {
-      return res.json({ success: true, source: 'atsoft-html', data: slots });
-    }
-
-    // Last fallback: return empty (let frontend handle)
-    res.json({ success: true, source: 'fallback', data: [] });
-
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ==========================================
-// POST /api/booking
-// ==========================================
-app.post('/api/booking', async (req, res) => {
-  try {
-    const { customerName, customerPhone, employeeId, services, appointmentDate, appointmentTime, notes } = req.body;
-    if (!customerName || !customerPhone || !appointmentDate || !appointmentTime) {
-      return res.status(400).json({ success: false, error: 'Missing required fields' });
-    }
-    const digits = customerPhone.replace(/\D/g, '');
-    const formattedPhone = digits.length === 10
-      ? `${digits.slice(0,3)}-${digits.slice(3,6)}-${digits.slice(6)}`
-      : customerPhone;
-    const timeStart = formatTime12h(appointmentTime);
-    const [h, m] = appointmentTime.split(':').map(Number);
-    const timeEnd = formatTime12h(`${String(h+1).padStart(2,'0')}:${String(m).padStart(2,'0')}`);
-
-    const result = await createAtsoftAppointment({
-      appointmentDate, customerName,
-      customerPhone: formattedPhone,
-      employeeId: parseInt(employeeId) || 0,
-      services, timeStart, timeEnd, notes
+  if (!date || !employeeId) {
+    return res.status(400).json({
+      success: false,
+      error: 'Missing required parameters: date and employeeId'
     });
+  }
 
-    if (result.status === 200) {
-      console.log(`📅 Booked: ${customerName} | ${services} | ${appointmentDate} ${timeStart}`);
-      res.json({ success: true, message: 'Appointment booked successfully!' });
-    } else {
-      res.status(500).json({ success: false, error: `ATSoft error: ${result.body}` });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Invalid date format. Use YYYY-MM-DD'
+    });
+  }
+
+  const empId = parseInt(employeeId);
+  if (isNaN(empId)) {
+    return res.status(400).json({
+      success: false,
+      error: 'employeeId must be a number'
+    });
+  }
+
+  try {
+    const pool = await getPool();
+
+    // Day of week from JavaScript: 0=Sun, 1=Mon, ..., 6=Sat.
+    // Matches ATSoft's WorkDays bitmask convention (bit 0=Sun).
+    // Using JS (not SQL DATEPART(dw)) avoids @@DATEFIRST dependency.
+    const dayOfWeek = new Date(date + 'T12:00:00').getDay();
+    const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    const dayName  = dayNames[dayOfWeek];
+
+    // Step 1: Look up the employee's schedule
+    const empResult = await pool.request()
+      .input('empId', sql.Int, empId)
+      .query(`
+        SELECT EmployeeID, FullName, WorkDays, DayOffStart, DayOffEnded
+        FROM Employees
+        WHERE EmployeeID = @empId
+      `);
+
+    if (empResult.recordset.length === 0) {
+      return res.status(404).json({ success: false, error: 'Employee not found' });
     }
+
+    const emp = empResult.recordset[0];
+    const workDaysMask = emp.WorkDays || 0;
+    const worksThisDay = (workDaysMask & (1 << dayOfWeek)) !== 0;
+
+    // Step 2A: Fixed weekly day off
+    if (!worksThisDay) {
+      console.log(`[schedule] ${emp.FullName} is off on ${dayName}s (WorkDays=${workDaysMask})`);
+      return res.json({
+        success: true,
+        source: 'sql',
+        isOffDay: true,
+        offReason: 'weekly-schedule',
+        message: `${emp.FullName} is off on ${dayName}s`,
+        data: buildDummySlots()   // legacy fallback: frontend without isOffDay support still disables all
+      });
+    }
+
+    // Step 2B: Vacation / time-off window (skip ATSoft's 2012 sentinel dates)
+    if (emp.DayOffStart && emp.DayOffEnded) {
+      const startYear = new Date(emp.DayOffStart).getFullYear();
+      const looksLikeSentinel = startYear < 2015;
+      if (!looksLikeSentinel) {
+        const checkDate = new Date(date + 'T12:00:00').getTime();
+        const offStart  = new Date(emp.DayOffStart).getTime();
+        const offEnd    = new Date(emp.DayOffEnded).getTime();
+        if (checkDate >= offStart && checkDate <= offEnd) {
+          console.log(`[schedule] ${emp.FullName} on vacation ${date}`);
+          return res.json({
+            success: true,
+            source: 'sql',
+            isOffDay: true,
+            offReason: 'vacation',
+            message: `${emp.FullName} is on vacation this day`,
+            data: buildDummySlots()
+          });
+        }
+      }
+    }
+
+    // Step 3: Employee is working — return already-booked slots so frontend can disable them
+    const result = await pool.request()
+      .input('date', sql.Date, date)
+      .input('empId', sql.Int, empId)
+      .query(`
+        SELECT OnTime
+        FROM Appointments
+        WHERE CAST(OnDate AS DATE) = @date
+          AND EmployeeID = @empId
+      `);
+
+    res.json({
+      success: true,
+      source: 'sql',
+      isOffDay: false,
+      data: result.recordset
+    });
   } catch (err) {
-    console.error('booking error:', err.message);
+    console.error('GET /api/availability error:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
+// ============================================================
+// POST /api/booking — create a new appointment
+// Matches ATSoft's real schema (based on sample data analysis).
+// Frontend sends: customerName, customerPhone, customerEmail,
+//                 employeeId, employeeName, services (string),
+//                 appointmentDate (YYYY-MM-DD), appointmentTime (HH:MM 24hr),
+//                 notes, duration (optional, defaults to 60 min)
+// ============================================================
+app.post('/api/booking', async (req, res) => {
+  const {
+    customerName,
+    customerPhone,
+    customerEmail,
+    employeeId,
+    employeeName,
+    services,
+    appointmentDate,    // YYYY-MM-DD (frontend field name)
+    appointmentTime,    // HH:MM 24-hour, e.g. "14:30"
+    notes,
+    duration            // minutes, optional
+  } = req.body;
+
+  // Also accept alternate names for flexibility
+  const date = appointmentDate || req.body.date;
+  const time = appointmentTime || req.body.time;
+  const durationMin = parseInt(duration) || 60;
+
+  // Validation
+  if (!customerName || !customerPhone || !employeeId || !date || !time) {
+    return res.status(400).json({
+      success: false,
+      error: 'Missing required fields: customerName, customerPhone, employeeId, appointmentDate, appointmentTime'
+    });
+  }
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ success: false, error: 'Invalid date format. Use YYYY-MM-DD' });
+  }
+
+  if (!/^\d{2}:\d{2}$/.test(time)) {
+    return res.status(400).json({ success: false, error: 'Invalid time format. Use HH:MM (24-hour)' });
+  }
+
+  try {
+    const pool = await getPool();
+
+    // Parse date + time into proper datetime objects
+    const [year, month, day] = date.split('-').map(Number);
+    const [startHour, startMin] = time.split(':').map(Number);
+
+    const onDateObj = new Date(year, month - 1, day, startHour, startMin, 0);
+    const endDateObj = new Date(onDateObj.getTime() + durationMin * 60 * 1000);
+
+    // Format OnTime as ATSoft expects: "H:MM AM/PM - H:MM AM/PM"
+    const onTimeStr = `${formatTime12(startHour, startMin)} - ${formatTime12(endDateObj.getHours(), endDateObj.getMinutes())}`;
+
+    // DateKey format is MDDYYYY without zero padding (e.g. "7292023" for July 29, 2023)
+    const dateKey = `${month}${String(day).padStart(2,'0')}${year}`;
+
+    // Week / quarter calculations
+    const weekNum = getISOWeekNumber(onDateObj);
+    const weekKey = `${weekNum}${year}`;
+    const biWeekNum = Math.ceil(weekNum / 2);
+    const biWeekKey = `${biWeekNum}${year}`;
+    const quarter = Math.ceil(month / 3);
+    const quarterKey = `${quarter}${year}`;
+
+    // Services as comma-separated string, capped at 128 chars
+    const servicesStr = (Array.isArray(services) ? services.join(', ') : (services || '')).slice(0, 128);
+
+    const recordGuid = generateGUID();
+    const empName = (employeeName || '').slice(0, 64);
+
+    const result = await pool.request()
+      .input('onDate',        sql.DateTime,    onDateObj)
+      .input('onTime',        sql.VarChar(64), onTimeStr)
+      .input('endDate',       sql.DateTime,    endDateObj)
+      .input('customerName',  sql.VarChar(64), customerName.slice(0, 64))
+      .input('customerPhone', sql.VarChar(16), customerPhone.slice(0, 16))
+      .input('email',         sql.VarChar(96), (customerEmail || '').slice(0, 96))
+      .input('empId',         sql.Int,         parseInt(employeeId))
+      .input('empName',       sql.VarChar(64), empName)
+      .input('description',   sql.VarChar(256),(notes || 'Online booking').slice(0, 256))
+      .input('services',      sql.VarChar(128),servicesStr)
+      .input('statusStr',     sql.VarChar(32), 'Scheduled')  // matches ATSoft samples
+      .input('recordGuid',    sql.VarChar(36), recordGuid)
+      .input('onDay',         sql.Int,         day)
+      .input('onMonth',       sql.Int,         month)
+      .input('onYear',        sql.Int,         year)
+      .input('dateKey',       sql.VarChar(10), dateKey)
+      .input('onWeek',        sql.Int,         weekNum)
+      .input('weekKey',       sql.VarChar(20), weekKey)
+      .input('onBiWeek',      sql.Int,         biWeekNum)
+      .input('biWeekKey',     sql.VarChar(20), biWeekKey)
+      .input('onQuarter',     sql.Int,         quarter)
+      .input('quarterKey',    sql.VarChar(20), quarterKey)
+      .query(`
+        INSERT INTO Appointments (
+          OnDate, OnTime, EndDate,
+          CustomerID, CustomerName, CustomerPhone, Email,
+          EmployeeID, EmployeeName, TechName,
+          Description, Services,
+          StatusA, StatusS, StatusStr, Scheduled,
+          RecordState, RecordGUID, EditTimestamp,
+          OnDay, OnMonth, OnYear, DateKey,
+          OnWeek, WeekKey, OnBiWeek, BiWeekKey,
+          OnQuarter, QuarterKey,
+          Locked, ByEmail, BySMS, RemindedSMS, RemindedEmail,
+          ColorIdx, ColorArgb, BlockOff,
+          IsOnline, ByRequest, ByRequestO,
+          Paid, TotalPaid, TransactionID,
+          RequestState, OnlineState, IsNew
+        )
+        OUTPUT INSERTED.AppointmentID
+        VALUES (
+          @onDate, @onTime, @endDate,
+          0, @customerName, @customerPhone, @email,
+          @empId, @empName, @empName,
+          @description, @services,
+          0, 0, @statusStr, 0,
+          3, @recordGuid, GETDATE(),
+          @onDay, @onMonth, @onYear, @dateKey,
+          @onWeek, @weekKey, @onBiWeek, @biWeekKey,
+          @onQuarter, @quarterKey,
+          0, 0, 0, 0, 0,
+          0, -1, 0,
+          1, 0, 0,
+          0, 0, '0',
+          0, 3, 1
+        )
+      `);
+
+    const newId = result.recordset[0]?.AppointmentID;
+    console.log(`✅ Booking #${newId}: ${customerName} (${customerPhone}) with ${empName} on ${date} ${onTimeStr}`);
+
+    res.json({
+      success: true,
+      appointmentId: newId,
+      recordGuid,
+      onTime: onTimeStr,
+      message: 'Booking confirmed'
+    });
+  } catch (err) {
+    console.error('POST /api/booking error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ---------- Helper functions ----------
+
+// Build all 22 half-hour slots from 9 AM to 7 PM (matches booking.html time grid).
+// Used to fill `data` when a tech is off, so frontends without isOffDay support
+// still show every slot as "taken" and prevent booking.
+function buildDummySlots() {
+  const slots = [];
+  for (let h = 9; h <= 19; h++) {
+    ['00', '30'].forEach(m => {
+      if (h === 19 && m === '30') return;
+      const hour12 = h > 12 ? h - 12 : h;
+      const ampm   = h >= 12 ? 'PM' : 'AM';
+      slots.push({ OnTime: `${hour12}:${m} ${ampm}` });
+    });
+  }
+  return slots;
+}
+
+// Convert 24-hour time to "H:MM AM/PM" (ATSoft's format, no leading zero on hour)
+function formatTime12(h, m) {
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const h12 = h % 12 || 12;
+  const mm = String(m).padStart(2, '0');
+  return `${h12}:${mm} ${ampm}`;
+}
+
+// ISO 8601 week number (1-53)
+function getISOWeekNumber(d) {
+  const target = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const dayNum = target.getUTCDay() || 7;
+  target.setUTCDate(target.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(target.getUTCFullYear(), 0, 1));
+  return Math.ceil((((target - yearStart) / 86400000) + 1) / 7);
+}
+
+// Simple RFC4122-ish GUID generator (good enough for a 36-char identifier)
+function generateGUID() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
+// ============================================================
+// DEBUG ENDPOINTS — REMOVE BEFORE GOING LIVE
+// Useful for discovering ATSoft's actual schema.
+// ============================================================
+
+app.get('/api/debug/tables', async (req, res) => {
+  try {
+    const pool = await getPool();
+    const result = await pool.request().query(`
+      SELECT TABLE_NAME
+      FROM INFORMATION_SCHEMA.TABLES
+      WHERE TABLE_TYPE = 'BASE TABLE'
+      ORDER BY TABLE_NAME
+    `);
+    res.json({ tables: result.recordset.map(r => r.TABLE_NAME) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/debug/schema/:tableName', async (req, res) => {
+  const { tableName } = req.params;
+  try {
+    const pool = await getPool();
+    const result = await pool.request()
+      .input('tbl', sql.NVarChar, tableName)
+      .query(`
+        SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = @tbl
+        ORDER BY ORDINAL_POSITION
+      `);
+    res.json({ table: tableName, columns: result.recordset });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/debug/sample/:tableName', async (req, res) => {
+  const { tableName } = req.params;
+  // Whitelist table name to prevent injection (since table names can't be parameterized)
+  if (!/^[A-Za-z0-9_]+$/.test(tableName)) {
+    return res.status(400).json({ error: 'Invalid table name' });
+  }
+  try {
+    const pool = await getPool();
+    const result = await pool.request().query(`SELECT TOP 3 * FROM [${tableName}]`);
+    res.json({
+      table: tableName,
+      columns: Object.keys(result.recordset[0] || {}),
+      samples: result.recordset
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// ERROR HANDLER (catches uncaught route errors)
+// ============================================================
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ success: false, error: err.message || 'Internal server error' });
+});
+
+// 404 for unknown routes
+app.use((req, res) => {
+  res.status(404).json({ success: false, error: `Route not found: ${req.method} ${req.path}` });
+});
+
+// ============================================================
+// START SERVER
+// ============================================================
 const PORT = process.env.PORT || 3456;
 app.listen(PORT, async () => {
-  console.log(`✅ Milano Booking API v3.0 running on port ${PORT}`);
-  console.log(`🌐 Mode: Cloud-first (ATSoft HTML scraping)`);
-  console.log(`💾 SQL Server: fallback only`);
-  // Pre-cache technicians
-  try { await scrapeEmployeesFromHTML(); } catch(e) {}
-  // Pre-login ATSoft
-  await loginAtsoft();
+  console.log('============================================');
+  console.log(`✅ Milano Booking API v4.0 running on port ${PORT}`);
+  console.log(`📡 Mode: SQL-direct (no HTML scraping)`);
+  console.log(`🔒 CORS allowed: ${allowedOrigins.join(', ')}`);
+  console.log('============================================');
+  try {
+    await getPool();
+  } catch (err) {
+    console.error('⚠️  Server started but database is unreachable. Will retry on first request.');
+  }
 });
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('\n🛑 Shutting down...');
+  if (poolPromise) {
+    const pool = await poolPromise;
+    await pool.close();
+  }
+  process.exit(0);
+});
+
+/*
+============================================================
+.env FILE TEMPLATE — create as C:\MILANO-BOOK\.env
+============================================================
+
+DB_SERVER=127.0.0.1
+DB_NAME=DbProvider
+DB_USER=sa
+DB_PASSWORD=atsoft
+DB_PORT=1433
+PORT=3456
+
+============================================================
+TEST URLS (use browser or iPhone)
+============================================================
+
+Public (via tunnel):
+  https://api.milanonailspa529.com/api/health
+  https://api.milanonailspa529.com/api/employees
+  https://api.milanonailspa529.com/api/services
+  https://api.milanonailspa529.com/api/availability?date=2026-06-30&employeeId=1
+  https://api.milanonailspa529.com/api/debug/tables
+  https://api.milanonailspa529.com/api/debug/schema/Appointments
+  https://api.milanonailspa529.com/api/debug/sample/Appointments
+
+Local (on Milano PC):
+  http://localhost:3456/api/health
+
+============================================================
+DEPLOYMENT (after replacing this file)
+============================================================
+
+In CMD:
+  cd C:\MILANO-BOOK
+  pm2 restart Milano-Booking-API
+  pm2 logs Milano-Booking-API --lines 30
+*/
